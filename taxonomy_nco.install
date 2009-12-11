@@ -1,0 +1,70 @@
+<?php
+// $Id$
+
+/**
+ * Implementation of hook_install()
+ *
+ * @file
+ * Creates DB table taxonomy_nco to store NCO analysis data
+ * 
+ */
+ 
+function taxonomy_nco_install() {
+  switch ($GLOBALS['db_type']) {
+    case 'mysqli':
+    case 'mysql':
+      db_query("CREATE TABLE IF NOT EXISTS {taxonomy_nco} (
+              `tid_a` INT NOT NULL,
+              `tid_b` INT NOT NULL,
+              `a_and_b` INT NOT NULL,
+              `a_or_b` INT NOT NULL,
+              `nco` FLOAT(8,4) NOT NULL,
+              PRIMARY KEY ( `tid_a`, `tid_b` ),
+              INDEX tid_a ( `tid_a` ),
+              INDEX tid_b ( `tid_b` ),
+              INDEX nco ( `nco` ),
+              INDEX a_and_b ( `a_and_b` )
+              ) ENGINE = MYISAM DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci;")
+              && drupal_set_message('taxonomy NCO table created');
+              
+       db_query("
+       CREATE TABLE IF NOT EXISTS {taxonomy_nco_forced} (
+              `tid_a` INT NOT NULL,
+              `tid_b` INT NOT NULL,              
+              `nco` FLOAT(8,4) NOT NULL,
+              PRIMARY KEY ( `tid_a`, `tid_b` ),
+              INDEX tid_a ( `tid_a` ),
+              INDEX tid_b ( `tid_b` ),
+              INDEX nco ( `nco` ),              
+              ) ENGINE = MYISAM DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci;       
+       ") && drupal_set_message('taxonomy NCO manual table created');
+  }
+}
+
+function taxonomy_nco_update_1() {
+  switch ($GLOBALS['db_type']) {
+    case 'mysqli':
+    case 'mysql':
+      $result[] = update_sql("ALTER TABLE {taxonomy_nco} ADD INDEX a_and_b ( `a_and_b` );");
+  }
+  return $result;
+}
+
+function taxonomy_nco_update_2() {
+  switch ($GLOBALS['db_type']) {
+    case 'mysqli':
+    case 'mysql':
+      $result[] = update_sql(
+      "CREATE TABLE IF NOT EXISTS {taxonomy_nco_forced} (
+              `tid_a` INT NOT NULL,
+              `tid_b` INT NOT NULL,              
+              `nco` FLOAT(8,4) NOT NULL,
+              PRIMARY KEY ( `tid_a`, `tid_b` ),
+              INDEX tid_a ( `tid_a` ),
+              INDEX tid_b ( `tid_b` ),
+              INDEX nco ( `nco` )             
+              ) ENGINE = MYISAM DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci;"
+      );
+  }
+  return $result;
+}

@@ -1,0 +1,855 @@
+<?php
+// $Id$
+
+/**
+ * @mainpage Taxonomy NCO Analysis
+ * 
+ * @file 
+ * taxonomy_nco_analysis.module performs Normalized Co-ocurrence taxonomy analysis 
+ * ... and stores NCO, intersection and union data in a table called taxonomy_nco
+ * 
+ */
+
+
+DEFINE('SEED_TERM_OCCURENCE_THRESHOLD', 4); // Terms must occur more times than this to be selected as seeds
+DEFINE('TAXONOMY_NCO_VOCABULARY', 1); // $vid to analyse
+DEFINE('SEEDS_PER_CRON', 1000); // how many seeds to process for each cron
+DEFINE('MINIMUM_ANALYSIS_INTERSECTION', 3); // We must have at least this intersection to make an entry in the NCO table. Note, if this is changed we can end up with partial data
+
+
+
+/////////////////
+// Hooks ////////
+/////////////////
+
+
+/**
+ * Implementation of hook_cron
+ * 
+ * Do chunked nco analysis
+ */
+function taxonomy_nco_analysis_cron() {
+  // check if we are running
+  if (variable_get('taxonomy_nco_analysis_running', FALSE) && !variable_get('taxonomy_nco_analysis_processing', FALSE)) {
+    taxonomy_nco_analysis_initial_run_process_batch();
+  } 
+  else {
+    if (variable_get('taxonomy_nco_analysis_ongoing_running', FALSE)) {
+      taxonomy_nco_analysis_ongoing_update_nco_table();
+    }
+  }
+}
+
+
+/**
+ * Hook perm
+ *
+ * @return unknown
+ */
+function taxonomy_nco_analysis_perm() {
+  return array('administer taxonomy nco');
+}
+
+
+/**
+ * Hook menu
+ *
+ * @param unknown_type $may_cache
+ */
+function taxonomy_nco_analysis_menu($may_cache) {
+  if ($may_cache) {
+    // ========== Admin menu items
+    // Menu here is duplicated to make the local tasks work 
+    // - but this is unnecessary, just need to find the right route
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis',
+      'title' => t('Taxonomy NCO Analysis'),
+      'description' => t('Taxonomy NCO analysis config'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => 'taxonomy_nco_analysis_admin_form',
+      'access' => user_access('administer taxonomy nco'),
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/settings',
+      'title' => t('Taxonomy NCO Analysis'),
+      'description' => t('Taxonomy NCO analysis config'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => 'taxonomy_nco_analysis_admin_form',
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+    );    
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/confirm',
+      'title' => t('Confirm Start NCO Analysis'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => array('taxonomy_nco_analysis_start_confirm', 'foo'),
+      //'access' => user_access('administer taxonomy nco'),   
+      'type' => MENU_CALLBACK,
+    );
+
+    //================ Clusters
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/force',
+      'title' => t('Enforced NCO'),
+      'description' => t('Enforced term equivalences'),
+      'callback' => 'taxonomy_nco_force',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/force_seed',
+      'title' => t('Enforced cluster seed'),      
+      'callback' => 'taxonomy_nco_force_seed',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/browse',
+      'title' => t('Browse clusters'),
+      'description' => t('Clusters'),
+      'callback' => 'taxonomy_nco_browse',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/cluster',
+      'title' => t('Walk term cluster'),
+      'description' => t('Cluster walk'),
+      'callback' => 'taxonomy_nco_cluster_test',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/size',
+      'title' => t('Cluster sizes'),
+      'description' => t('Actual nodes in a cluster'),
+      'callback' => 'taxonomy_nco_cluster_size',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    $items[] = array(
+      'path' => 'admin/settings/taxonomy_nco_analysis/rebuild',
+      'title' => t('Rebuild clusters'),
+      'description' => t('Rebuild all the clustering'),
+      'callback' => 'taxonomy_nco_cluster_rebuild',      
+      'access' => user_access('administer taxonomy nco'),
+      'type' => MENU_LOCAL_TASK,
+    );
+    
+  }
+  
+  return $items;
+}
+
+
+function taxonomy_nco_analysis_block($op = 'list', $delta = 0, $edit = array()){
+  if ($op == 'list') {
+    $blocks = array(
+      'nco_force' => array('info' => t('NCO: Force Term relationship')),
+    );
+    return $blocks;
+  } 
+  else if ($op == 'view') {
+    switch ($delta) {
+      case 'nco_force':        
+        $block['subject'] = 'Force term relationship';        
+        $block['content'] = theme('taxonomy_nco_analysis_block_force_relationship');
+        return $block;
+    }
+  } 
+}
+
+//////////////////////////////////////////////
+// Admin form                        /////////
+//////////////////////////////////////////////
+
+
+/**
+ * Defines the admin form
+ *
+ * @return array the form definition
+ */
+function taxonomy_nco_analysis_admin_form() {
+  $seed_term_ocurrence_threshold = variable_get('taxonomy_nco_analysis_seed_term_occurrence_threshold', SEED_TERM_OCCURENCE_THRESHOLD);
+  $mininum_analysis_intersection = variable_get('taxonomy_nco_analysis_minimum_analysis_intersection', MINIMUM_ANALYSIS_INTERSECTION);
+  $vocabulary = variable_get('taxonomy_nco_analysis_vocabulary', TAXONOMY_NCO_VOCABULARY);
+  $ongoing_analysis = variable_get('taxonomy_nco_analysis_ongoing_running', FALSE);
+  $form['start_analysis_button'] = array(
+    '#type' => 'submit',
+    '#value' => 'Start initial analysis',
+  );
+  $form['seed_term_occurrence_threshold'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Seed term occurrence threshold'),
+    '#description' => t('Terms must occur on more profiles than this to be selected as seeds for NCO analysis.'),
+    '#default_value' => $seed_term_ocurrence_threshold,
+  );
+  $form['mininum_analysis_intersection'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Minimum analysis intersection count'),
+    '#description' => t('Terms must occur together on at lest this many nodes for co-ocurrence data to be recorded in the NCO table.'),
+    '#default_value' => $mininum_analysis_intersection,
+  );
+  $form['vocabulary'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Vocabulary $vid for NCO analysis'),
+    '#description' => t('NCO analysis will only be performed on this vocabulary'),
+    '#default_value' => $vocabulary,
+  );
+  $form['ongoing_analysis_enabled'] = array(
+    '#title' => t('Ongoing analysis enabled'),
+    '#type' => 'checkbox',
+    '#description' => 'Enable/Disable the ongoing analysis of terms on modified nodes',
+    '#default_value' => $ongoing_analysis,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save settings'),
+  );  
+  return $form;
+}
+
+/**
+ * validates the admin form content
+ *
+ * @param integer $form_id
+ * @param array $form_values
+ */
+function taxonomy_nco_analysis_admin_form_validate($form_id, $form_values) {
+  // TODO: validation
+}
+
+
+/**
+ * Handles the submission of the main admin form
+ *
+ * @param integer $form_id
+ * @param array $form_values
+ */
+function taxonomy_nco_analysis_admin_form_submit($form_id, $form_values) {
+  //drupal_set_message(print_r($form_values, 1));
+  if ($form_values['op'] == 'Start initial analysis') {
+    drupal_goto('admin/settings/taxonomy_nco_analysis/confirm');
+  } 
+  else {
+    $seed_term_ocurrence_threshold = $form_values['seed_term_occurrence_threshold'];
+    $mininum_analysis_intersection = $form_values['mininum_analysis_intersection'];
+    $vocabulary = $form_values['vocabulary'];
+    $ongoing_analysis = $form_values['ongoing_analysis_enabled'];
+    variable_set('taxonomy_nco_analysis_seed_term_occurrence_threshold', $seed_term_ocurrence_threshold);
+    variable_set('taxonomy_nco_analysis_minimum_analysis_intersection', $mininum_analysis_intersection);
+    variable_set('taxonomy_nco_analysis_vocabulary', $vocabulary);
+    if ($ongoing_analysis) {
+      taxonomy_nco_analysis_ongoing_analysis_on();
+    }
+    else {
+      taxonomy_nco_analysis_ongoing_analysis_off();
+    }
+  }
+}
+
+
+//////////////////////////////////////////////
+// Admin Confirm form                /////////
+//////////////////////////////////////////////
+
+/**
+ * Generate for to confirm starting NCO analysis initial run
+ *
+ * @return unknown
+ */
+function taxonomy_nco_analysis_start_confirm($foo) {
+  $text = '<p>';
+  $text .= t('Please confirm that you would like to start an NCO analysis initial run.');
+  $text .= '</p>';
+  $text .= '<p>';
+  $text .= t('Batches of @number_per_batch seed terms will be analysed each cron run until all terms have been processed.', array('@number_per_batch' => SEEDS_PER_CRON));
+  $text .= '</p>';
+  $text .= '<p>';  
+  $text .= t('This can take a long time.');
+  $text .= '</p>';
+  $form['confirm_text'] = array(
+    '#value' => $text,
+    '#description' => 'Confirm NCO big run start',
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Confirm'),
+  );  
+  return $form;
+}
+
+function taxonomy_nco_analysis_start_confirm_submit($form_id, $form_values) {
+  taxonomy_nco_analysis_initiate_global_analysis(0);  
+  drupal_set_message('Taxonomy NCO initial processing run initiated.');
+  drupal_goto('admin/settings/taxonomy_nco_analysis');
+}
+
+
+//////////////////////////////////////////////
+// Functions for generating NCO data /////////
+//////////////////////////////////////////////
+
+
+// The main generation run - going through term_node
+
+/**
+ * Initiate NCO analysis run
+ * This function starts up an analysis run
+ */
+function taxonomy_nco_analysis_initiate_global_analysis($limit) {
+  watchdog('taxonomy nco', 'Bulk processing - initiating bulk analysis run - batches of seed terms will be processed on cron');
+  $tid_a_array = taxonomy_nco_analysis_get_seed_terms($limit);
+  watchdog('taxonomy nco', sizeof($tid_a_array) .' seed terms found');
+  variable_set('taxonomy_nco_analysis_seed_terms', $tid_a_array);
+  variable_set('taxonomy_nco_analysis_running', TRUE);
+  variable_set('taxonomy_nco_analysis_processing', FALSE);
+  variable_set('taxonomy_nco_analysis_last_term_processed', -1);
+  taxonomy_nco_analysis_reset_abort_flag();  
+}
+
+
+/**
+ * Set taxonomy nco to perform ungoing updates to the nco table on cron
+ *
+ */
+function taxonomy_nco_analysis_ongoing_analysis_on() {
+  variable_set('taxonomy_nco_analysis_ongoing_running', TRUE);
+  watchdog('taxonomy nco', 'Ongoing analysis set to ON');
+  taxonomy_nco_analysis_reset_abort_flag();  
+}
+
+
+/**
+ * * Set taxonomy nco not to perform ungoing updates to the nco table on cron
+ *
+ */
+function taxonomy_nco_analysis_ongoing_analysis_off() {
+  variable_set('taxonomy_nco_analysis_ongoing_running', FALSE);
+  watchdog('taxonomy nco', 'Ongoing analysis set to OFF');  
+}
+
+
+/**
+ * process a batch of seeds on a big initial run
+ * this runs off cron
+ *
+ */
+function taxonomy_nco_analysis_initial_run_process_batch() {
+  watchdog('taxonomy nco', 'Bulk processing - cron batch triggered');  
+  // cron's a bit like a thread ..
+  variable_set('taxonomy_nco_analysis_processing', TRUE);
+  // get the seed terms
+  $tid_a_array = variable_get('taxonomy_nco_analysis_seed_terms', -1);
+  $last_index = variable_get('taxonomy_nco_analysis_last_term_processed', -1);
+  // process the next X seeds
+  $seeds_per_cron = variable_get('taxonomy_nco_analysis_seeds_per_cron', SEEDS_PER_CRON);
+  for ($i = 1; $i <= $seeds_per_cron; $i++) {
+    $current_index = $last_index + $i;
+    if ($current_index >= sizeof($tid_a_array)) {
+      taxonomy_nco_analysis_finished();
+      return;
+    }
+    taxonomy_nco_analysis_analyse_term($tid_a_array[$current_index]);
+  }
+  // store where we've got to so we can come back on next cron
+  variable_set('taxonomy_nco_analysis_last_term_processed', $current_index);  
+  // we're done for this cron run..
+  variable_set('taxonomy_nco_analysis_processing', FALSE); 
+  watchdog('taxonomy nco', 'Bulk processing - this cron batch finished');
+}
+
+
+/**
+ * routine updates to the NCO table
+ * - keep a variable to record the last update time
+ * - ask for the NCO table to be updated from that time up to the present
+ */
+function taxonomy_nco_analysis_ongoing_update_nco_table() {
+  $now = time();
+  $time = variable_get('taxonomy_nco_analysis_last_update', -1);
+  variable_set('taxonomy_nco_analysis_last_update', $now);
+  if ($time != -1) {
+    taxonomy_nco_analysis_update_nco_table_between($time, $now);
+  } 
+  else {
+    watchdog('taxonomy nco', 'Update timebase set - first update will occur on next cron');
+  }
+}
+
+
+/**
+ * update the NCO table for a given time interval relating to node updates
+ * - look at the node table to find updated nodes
+ * - recalculate NCO for these terms as necessary
+ *
+ * @param unknown_type $from_time
+ * @param unknown_type $to_time
+ */
+function taxonomy_nco_analysis_update_nco_table_between($from_time, $to_time) {
+  $tids = taxonomy_nco_analysis_tids_on_nodes_updated_between($from_time, $to_time);
+  // should this selection process be done as 2 big queries, or should we go through the terms one by one ? 
+  // here's the one by one way ...
+  if (is_array($tids)) {
+    watchdog('taxonomy nco', 'Update - found changed nodes');
+    foreach ($tids as $tid) {
+      if (taxonomy_nco_analysis_is_seed($tid)) {  // (is this a tid_a) or (has this become a tid_a) ?
+        taxonomy_nco_analysis_analyse_term($tid);   // recalc whole seed
+      }
+      $related_seeds = taxonomy_nco_analysis_get_related_seeds($tid);
+      if ($related_seeds > 0) {
+        watchdog('taxonomy nco', 'Update - tid_b: '. $tid .' found '. sizeof($related_seeds) .' related seeds');
+      }
+      if (is_array($related_seeds)) {
+        foreach ($related_seeds as $tid_a) {        // (is this a tid_b) or (has this become a tid_b) ? // for each tid_a that this term relates to
+          if (!in_array($tid_a, $tids)) {  // (have we already recalculated the seed that this term relates to) ?
+            taxonomy_nco_analysis_analyse_relationship($tid_a, $tid);
+          }
+        }
+      }
+    }
+    watchdog('taxonomy nco', 'Update - completed');
+  } 
+  else {
+    watchdog('taxonomy nco', 'Update - no changed nodes found');
+  }
+}
+
+
+/**
+ * find seed terms related to a given tid_b in the nco table
+ *
+ * @param unknown_type $tid_b
+ */
+function taxonomy_nco_analysis_get_related_seeds($tid_b) {
+  // find the seeds that are related to this tid (find the $tib_a's)
+  $sql = "select tid_a from {taxonomy_nco} where tid_b = %d";
+  $result = db_query($sql, $tid_b);
+  while ($row = db_fetch_array($result)) {
+    $tids[] = $row['tid_a'];
+  }
+  return $tids;
+}
+
+
+/**
+ * return true if this term is a seed term
+ *
+ * @param unknown_type $tid
+ */
+function taxonomy_nco_analysis_is_seed($tid) {
+  $seed_term_ocurrence_threshold = variable_get('taxonomy_nco_analysis_seed_term_occurrence_threshold', SEED_TERM_OCCURENCE_THRESHOLD);
+  $sql = "select count(tid) from {term_node} where tid = %d";
+  $result = db_query($sql, $tid);
+  $row = db_fetch_array($result);
+  $occurrence = $row['count(tid)'];
+  return $occurrence > $seed_term_ocurrence_threshold;
+}
+
+
+/**
+ * Get tids in our vocab on nodes that have been updated since a given time
+ *
+ * @param unknown_type $time
+ */
+function taxonomy_nco_analysis_tids_on_nodes_updated_between($time, $now) {
+  // Get tids that may have been updated
+  $vocabulary = variable_get('taxonomy_nco_analysis_vocabulary', TAXONOMY_NCO_VOCABULARY);
+  $sql = "select tn.tid from {node} n 
+          join {term_node} tn on n.nid = tn.nid 
+          join {term_data} td on tn.tid = td.tid 
+          where n.changed > %d
+          and n.changed < %d
+          and td.vid = %d";
+  $result = db_query($sql, $time, $now, $vocabulary);
+  while ($row = db_fetch_array($result)) {
+    $tids[] = $row['tid'];
+  }
+  return $tids;
+}
+
+
+/**
+ * Get common tids according to seed term occurence threshold
+ *
+ * @param unknown_type $limit
+ */
+function taxonomy_nco_analysis_get_seed_terms($limit = 1000) {
+  // find common tids - those with more occurences than the seed ocurrence threshold 
+  // seed terms become known as $tid_a
+  $sql_common_tids = "select tn.tid from {term_node} tn 
+                      join {term_data} td on tn.tid = td.tid 
+                      where td.vid = %d 
+                      group by tn.tid having count(tn.tid) > %d";
+
+  $vocabulary = variable_get('taxonomy_nco_analysis_vocabulary', TAXONOMY_NCO_VOCABULARY);
+  $seed_term_ocurrence_threshold = variable_get('taxonomy_nco_analysis_seed_term_occurrence_threshold', SEED_TERM_OCCURENCE_THRESHOLD);
+  // limit for testing
+  if ($limit>0) {
+    $sql_common_tids .= " limit %d";
+    $result_common_tids = db_query($sql_common_tids, $vocabulary, $seed_term_ocurrence_threshold, $limit);
+  } 
+  else {
+    $result_common_tids = db_query($sql_common_tids, $vocabulary, $seed_term_ocurrence_threshold);
+  }
+  while ($row_common_tids = db_fetch_array($result_common_tids)) {
+    $seed_terms[] = $row_common_tids['tid'];
+  }  
+  return ($seed_terms);
+}
+
+
+/**
+ * Analyse a term id (seed analysis)
+ * - find related tids
+ * - calculate NCO for these terms
+ * - call db write function to make entries in NCO table
+ *
+ * @param unknown_type $tid
+ */
+function taxonomy_nco_analysis_analyse_term($tid_a) {
+  // TODO: what about these abort checks? this function is used in ongoing stuff now too
+  // abort didn't seem to be working properly
+  // can it be made to work?
+  // can it also work in the context of ongoing updates?
+  if (taxonomy_nco_analysis_abort_check()) {
+    return;
+  }
+  watchdog('taxonomy nco', 'Processing seed term: '. $tid_a);
+  // find the tids that are related to this tid (find the $tib_b's)
+  $sql_related_tids = "select distinct tn1.tid from {term_node} tn1 
+                       join {term_node} tn2 on tn1.nid = tn2.nid
+                       join {term_data} td on tn1.tid = td.tid 
+                       where tn2.tid = %d and td.vid = %d";
+  $vocabulary = variable_get('taxonomy_nco_analysis_vocabulary', TAXONOMY_NCO_VOCABULARY);
+  $result_related_tids = db_query($sql_related_tids, $tid_a, $vocabulary);
+  while ($row_related_tids = db_fetch_array($result_related_tids)) {
+    if (taxonomy_nco_analysis_abort_check()) {
+      return;
+    }
+    $tid_b = $row_related_tids['tid'];
+    if ($tid_a == $tid_b) {
+      continue;
+    }
+    //watchdog('taxonomy nco', 'analysing related term: '. $tid_b);
+    taxonomy_nco_analysis_analyse_relationship($tid_a, $tid_b);
+  }
+  //watchdog('taxonomy nco', 'Seed term analysis complete');
+}
+
+
+/**
+ * analyse the NCO relationship between 2 terms
+ * - write the results to the DB
+ *
+ * @param unknown_type $tid_a
+ * @param unknown_type $tid_b
+ * 
+ */
+function taxonomy_nco_analysis_analyse_relationship($tid_a, $tid_b) {
+  // Perform NCO analysis between $tid_a and $tid_b
+  // Count intersection
+  $sql_intersection = "select count(distinct tn1.nid) as intersection_count from {term_node} tn1
+                       join {term_node} tn2 on tn1.nid = tn2.nid
+                       where tn1.tid = %d and tn2.tid = %d";
+  $result_intersection = db_query($sql_intersection, $tid_a, $tid_b);
+  $row_intersection = db_fetch_array($result_intersection);
+  $intersection_count = $row_intersection['intersection_count'];
+  $mininum_analysis_intersection = variable_get('taxonomy_nco_analysis_minimum_analysis_intersection', MINIMUM_ANALYSIS_INTERSECTION);
+  if ($intersection_count >= $mininum_analysis_intersection) {
+    // Count union
+    $sql_union = "select count(DISTINCT tn.nid) as union_count from {term_node} tn where tid = %d or tid = %d";
+    $result_union = db_query($sql_union, $tid_a, $tid_b);
+    $row_union = db_fetch_array($result_union);
+    $union_count = $row_union['union_count'];
+    taxonomy_nco_analysis_db_write($tid_a, $tid_b, $intersection_count, $union_count);  // write to DB
+  }
+}
+
+
+/**
+ * Write NCO data to DB
+ *
+ * @param unknown_type $tid_a
+ * @param unknown_type $tid_b
+ * @param unknown_type $intersection_count
+ * @param unknown_type $union_count
+ */
+function taxonomy_nco_analysis_db_write($tid_a, $tid_b, $intersection_count, $union_count) {
+  $nco = $intersection_count / $union_count;
+  $sql = "replace into {taxonomy_nco} (tid_a, tid_b, a_and_b, a_or_b, nco) values (%d, %d, %d, %d, %f)";
+  $result = db_query($sql, $tid_a, $tid_b, $intersection_count, $union_count, $nco);
+  return $result;
+}
+
+
+/**
+ * We're done..
+ *
+ */
+function taxonomy_nco_analysis_finished() {
+  watchdog('taxonomy nco', 'Bulk processing run completed');
+  variable_set('taxonomy_nco_analysis_processing', FALSE); 
+  variable_set('taxonomy_nco_analysis_running', FALSE);  
+}
+
+
+/**
+ * Check to see if the abort flag has been set
+ * tidy up
+ */
+function taxonomy_nco_analysis_abort_check() {
+  $result = FALSE;
+  if (variable_get('taxonomy_nco_analysis_abort', FALSE)) {
+    variable_set('taxonomy_nco_analysis_running', FALSE);
+    variable_set('taxonomy_nco_analysis_processing', FALSE);    
+    $result = TRUE;
+  }
+  return $result;
+}
+
+
+function taxonomy_nco_analysis_abort() {
+  variable_set('taxonomy_nco_analysis_abort', TRUE);
+  watchdog('taxonomy nco', 'Abort');
+}
+
+
+/**
+ * reset the abort flag
+ *
+ */
+function taxonomy_nco_analysis_reset_abort_flag() {
+  variable_set('taxonomy_nco_analysis_abort', FALSE);
+}
+
+
+
+//////////////////////////////////////////////////////////////
+/////// Testing & prototype functions ////////////////////////
+//////////////////////////////////////////////////////////////
+  
+/* Test data set queries
+
+// best 200 by nco  
+select td1.name, td2.name, txn.nco, txn.a_and_b, txn.a_or_b from taxonomy_nco txn
+join term_data td1 on txn.tid_a = td1.tid
+join term_data td2 on txn.tid_b = td2.tid
+order by txn.nco desc limit 200;
+
+// best 250 by nco but where intersection > 1
+select td1.name, td2.name, txn.nco, txn.a_and_b, txn.a_or_b from taxonomy_nco txn
+join term_data td1 on txn.tid_a = td1.tid
+join term_data td2 on txn.tid_b = td2.tid
+where txn.a_and_b > 1
+order by txn.nco desc limit 250;
+
+ */
+
+
+
+// Test 
+
+/**
+ * Display the array of seed terms held between cron runs on the first time bulk analysis
+ *
+ */
+function taxonomy_nco_analysis_show_seeds() {
+  drupal_set_message(print_r(variable_get('taxonomy_nco_analysis_seed_terms', -1)));
+}
+ 
+/**
+ * Report status of Taxonomy NCO
+ * needs updating
+ *
+ */
+function taxonomy_nco_analysis_report_status() {
+  $seed_terms = variable_get('taxonomy_nco_analysis_seed_terms', -1);
+  $running = variable_get('taxonomy_nco_analysis_running', -1);
+  $processing = variable_get('taxonomy_nco_analysis_processing', -1);
+  $last_processed = variable_get('taxonomy_nco_analysis_last_term_processed', -1);  
+  drupal_set_message('taxonomy_nco running:'. $running .' processing: '. $processing .' last seed processed: '. $last_processed .' number of seeds: '. sizeof($seed_terms));
+}
+
+
+/**
+ * Simple function to do prototype display of NCO .. termnames
+ *
+ * @param unknown_type $tids
+ * @return unknown
+ */
+function taxonomy_nco_analysis_tids_to_names($tids) {
+  $output ='NCO';
+  foreach ($tids as $tid) {
+    $term_object = taxonomy_get_term($tid);
+    $output .= ' .. '. $term_object->name;
+  }
+  return $output; 
+}
+
+/**
+ * Force nco for two terms
+ * @param $tid_a
+ * @param $tid_b
+ * @param $nco
+ * @return unknown_type
+ */
+function taxonomy_nco_force($tid_a = null, $tid_b = null, $nco = null){
+  if ($tid_a && $tid_b && !is_null($nco)) {
+    taxonomy_nco_force_similar_terms($tid_a, $tid_b, $nco);
+  }  
+  
+  $result = db_query("select f.tid_a, tda.name, f.tid_b, tdb.name, f.nco from {taxonomy_nco_forced} f JOIN {term_data} tda on f.tid_a = tda.tid JOIN {term_data} tdb on f.tid_b = tdb.tid");
+  while ($row = db_fetch_array($result)) {
+    $enforcements[]= $row;
+  }  
+   
+  $output = theme('table', array('a', '' , 'b', '', 'nco' ), $enforcements); 
+  return $output;   
+}  
+
+
+function taxonomy_nco_browse($tid_a = null, $limit=100){
+  
+  $header = array(
+    array('data' => 'tid a', 'field' => 'f.tid_a'),
+    array('data' => 'term a', 'field' => 'tda.name'),
+    array('data' => 'tid b', 'field' => 'f.tid_b'),
+    array('data' => 'term b', 'field' => 'tdb.name'),
+    array('data' => 'a union b', 'field' => 'f.a_or_b'),
+    array('data' => 'a intersect b', 'field' => 'f.a_and_b'),
+    array('data' => 'nco', 'field' => 'f.nco', 'sort' => 'desc' ),
+  );
+  $sql = "select f.tid_a, tda.name, f.tid_b, tdb.name as name_b, f.a_or_b, f.a_and_b, f.nco from {taxonomy_nco} f JOIN {term_data} tda on f.tid_a = tda.tid JOIN {term_data} tdb on f.tid_b = tdb.tid";
+  $tablesql = tablesort_sql($header);  
+  $result = pager_query($sql . $tablesql, $limit);
+  while ($row = db_fetch_array($result)) {
+    $row['tid_a'] = l($row['tid_a'], 'admin/settings/taxonomy_nco_analysis/cluster/'. $row['tid_a']);
+    $row['tid_b'] = l($row['tid_b'], 'admin/settings/taxonomy_nco_analysis/cluster/'. $row['tid_b']);
+    $rows[]= $row;
+  }  
+  if (!$rows) {
+    $rows[] = array(array('data' => 'nothing', 'colspan' => 5));
+  }   
+  $output .= theme('table', $header, $rows);
+  $output .= theme('pager', NULL, $limit, 0);
+  return $output;   
+}  
+
+
+function taxonomy_nco_cluster_test($tid, $nco_local = 0.06, $power = 5) {
+  
+  $term = taxonomy_get_term($tid);    
+  $clusters = taxomomy_nco_clustering_clusters_calculate(array((array) $term), $nco_local, $power);
+  foreach ($clusters[$tid] as $row_tid) {
+    $row_term = taxonomy_get_term($row_tid);
+    $row_nco = taxonomy_nco_get_relationship($tid, $row_tid);
+    $rows[] =  array($row_tid, $row_term->name, $row_nco['nco']); 
+  }
+  $output .= 'min nco: '. DEFAULT_MINIMUM_MATCH_NCO .' local: '.$nco_local .' power:' .$power;
+  $output .= theme('table', array('tid','name', 'nco'), $rows);
+
+  
+  $result = db_query("select d.name, d.tid from {taxonomy_nco_cluster} c join term_data d on c.tid = d.tid and c.clusterid = %d", $tid); 
+  while ($row = db_fetch_array($result)) {
+    $rows2[] = $row;
+  }  
+  $output .= '<h2>existing</h2>';
+  $output .= theme('table', array('name', 'tid'), $rows2);  
+  return $output; 
+}
+ 
+function taxonomy_nco_cluster_size($country = null, $limit = 100) {
+  $members = _soe_explore_top_subjects($country, $limit);
+  $output = theme('table', array('count', 'tid', 'name'), $members);
+  return $output; 
+}
+
+function taxonomy_nco_force_seed($tid = null) {
+  if ($tid) {
+    taxonomy_nco_clustering_add_seed($tid);
+  }
+  $seeds = taxonmy_nco_clustering_get_forced_seeds();
+  foreach ($seeds as $tid => $data) {
+    $term = taxonomy_get_term($tid);    
+    $rows[] = array(l($term->name, taxonomy_term_path($term)));
+  } 
+  $output = theme('table', array('seeds'), $rows);
+  return $output;  
+}
+
+function taxonomy_nco_cluster_rebuild($go = false) {
+  if ($go) {
+    set_time_limit(0);
+    $count = taxonomy_nco_clustering_term_usage_count();
+    $clusters = taxomomy_nco_clustering_clusters_calculate_all($count);
+    taxonomy_nco_clustering_clusters_insert($clusters);
+    return "done"; 
+  }
+  else {
+    return "add another element to the url to do it";
+  }  
+}
+
+
+
+
+function theme_taxonomy_nco_analysis_block_force_relationship(){
+  $tid = everything_context_get_current_tid();  
+  if ($tid) {
+    $output .= drupal_get_form('taxonomy_nco_analysis_force_relationship_form', $tid );
+    $data = taxonomy_nco_related_terms(array($tid));
+    foreach ($data as $row_tid => $row_nco) {
+      $term = taxonomy_get_term($row_tid);
+      $rows[] = array(l($term->name, taxonomy_term_path($term)), $row_nco);
+    }
+    $output .= theme('table', array('term', 'nco'), $rows);    
+  }
+  
+  return $output;
+}
+
+function taxonomy_nco_analysis_force_relationship_form($tid) {
+  $term = taxonomy_get_term($tid);
+  $form['tid_a_value'] = array(    
+    '#value' => $term->name,
+    '#title' => 'term',
+  );
+  $form['tid_a_seed'] = array(    
+    '#value' => '<p>'.l('Make this a cluster seed', 'admin/settings/taxonomy_nco_analysis/force_seed/'.$tid).'</p>',    
+  );
+  
+  $form['tid_a'] = array(
+    '#type' => 'value',
+    '#value' => $tid,
+  );
+  $form['tid_a'] = array(
+    '#type' => 'value',
+    '#value' => $tid,
+  ); 
+  $form['term'] = array(
+    '#type' => 'textfield',    
+    '#autocomplete_path' => 'taxonomy/autocomplete/'. TAXONOMY_NCO_VOCABULARY,
+    '#title' => 'Related term',    
+  );
+  $form['nco'] = array(
+    '#type' => 'textfield',    
+    '#default_value' => '0.5',    
+    '#title' => 'nco',
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'submit',
+  );
+  return $form;
+}
+
+function taxonomy_nco_analysis_force_relationship_form_submit($form_id, $form_values){
+  $tids = taxonomy_get_term_by_name($form_values['term']);  
+  if (is_array($tids)) {
+    $term = array_shift($tids);
+    if ($term->tid) {      
+      taxonomy_nco_force_similar_terms($form_values['tid_a'], $term->tid, $form_values['nco']);
+    }
+  }
+}

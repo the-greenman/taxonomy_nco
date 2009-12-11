@@ -1,0 +1,246 @@
+<?php
+// $Id$
+
+/**
+ * @mainpage Taxonomy NCO Clustering
+ * 
+ * @file 
+ * Taxonomy nco clustering - this module uses the data in the taxonomy_nco table to find clusters of terms,
+ * and looks for the top term AKA seed term.
+ *
+ * Clustering is performed on cron by a walking algorithm which looks for similar terms withing a given NCO range.
+ * 
+ * function taxonomy_nco_clustering_top_clusters returns the top taxonomy clusters for the NCO vocabulary.
+ * 
+ * function theme_taxonomy_nco_clustering_top_clusters themes a simple display of the top cluster terms.
+ * 
+ * The NCO vocabulary is defined at the top of the taxonomy_nco_analysis.module
+ * 
+ * Important Note: Changing the NCO vocabulary would require clearing of the NCO and clustering DB tables, 
+ * and regeneration of NCO and clustering data.
+ * 
+ */
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Public functions                                                                                //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/**
+ * Returns the top taxonomy clusters for the current vocab as an array. Specify the number of top
+ * clusters required in $limit. Each member off the root of the array is a cluster in the form:
+ * 
+ *  [438] => Array
+ *      (
+ *          [count] => 2326         // the total number of nodes tagged with terms in this cluster
+ *          [tid] => 438            // the tid of the cluster seed term
+ *          [name] => Tai Chi       // the name of the cluster seed term
+ *      ) 
+ *
+ * @param cardinal $limit
+ */
+function taxonomy_nco_clustering_top_clusters($limit = NULL) {
+  // TODO: better name, get variable, admin interface for $vid
+  $vid = TAXONOMY_NCO_VOCABULARY;
+  if ($limit > 0) {
+    $limit = " LIMIT $limit ";
+  }
+  $sql = "SELECT COUNT(*) AS count, c.clusterid as tid, td2.name 
+    FROM {node} n   
+    INNER JOIN {term_node} tn ON (n.nid = tn.nid)
+    INNER JOIN {term_data} td ON (tn.tid = td.tid)
+    INNER JOIN {taxonomy_nco_cluster} c ON (td.tid = c.tid)
+    INNER JOIN {term_data} td2 ON (td2.tid = c.clusterid)
+    WHERE td.vid = %d
+    GROUP BY c.clusterid
+    ORDER BY count DESC
+    $limit";
+    $result = db_query($sql, $vid);
+  while ($row = db_fetch_array($result)) {
+    $clusters[$row['tid']] = $row;
+  }
+  return $clusters;
+}
+
+
+
+
+//----------------- Seed management
+/**
+ * Returns a list of terms that should be used as seeds.
+ * We are not yet very good at finding the best seed terms for clustering, 
+ * this lets us manually set important ones. 
+ * @return unknown_type
+ */
+function taxonmy_nco_clustering_get_forced_seeds(){
+  $forced_seeds = variable_get('nco_seeds',array());
+  return $forced_seeds; 
+}
+
+/**
+ * Add a seed term to the forced seed set
+ * @param $tid
+ * @return unknown_type
+ */
+function taxonomy_nco_clustering_add_seed($tid) {
+  $forced_seeds = taxonmy_nco_clustering_get_forced_seeds();
+  $forced_seeds[$tid] = array('tid'=> $tid);  
+  variable_set('nco_seeds', $forced_seeds);
+}
+
+/**
+ * Remove a seed term from the forced seed set
+ * @param $tid
+ * @return unknown_type
+ */
+function taxonomy_nco_clustering_delete_seed($tid) {
+  $forced_seeds = taxonmy_nco_clustering_get_forced_seeds();
+  unset($forced_seeds[$tid]);  
+  variable_set('nco_seeds', $forced_seeds);
+}
+
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Functions for generating NCO clustering data                                                    //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/*
+ * Implementation of hook_cron
+ */
+function taxonomy_nco_clustering_cron(){
+  $cluster_delay = 36000; // only cluster every x seconds
+  if ((time() - $cluster_delay) > variable_get('taxonomy_nco_last_cron', 0)) {
+    variable_set('taxonomy_nco_last_cron', time());
+    $count = taxonomy_nco_clustering_term_usage_count();
+    $clusters = taxomomy_nco_clustering_clusters_calculate_all($count);
+    taxonomy_nco_clustering_clusters_insert($clusters);  
+  }
+} 
+
+/**
+ * Generates a big list of every term in a vocabulary. 
+ * Used as the seed for a global clustering run. 
+ * @param $vid
+ * @return unknown_type
+ */
+function taxonomy_nco_clustering_term_usage_count($vid = TAXONOMY_NCO_VOCABULARY) {
+  if ($vid) {
+    $where = ' AND td.vid = %d';
+    $data[] = $vid;
+  }
+  $sql = "SELECT td.name, td.tid, count(tn.nid) AS count 
+          FROM term_data td 
+          INNER JOIN term_node tn ON td.tid = tn.tid
+          WHERE 1 $where
+          GROUP BY tn.tid
+          ORDER BY count DESC                  
+          ";
+  $result = db_query($sql, $data);
+  while ($row = db_fetch_array($result)) {
+    $results[$row['tid']] = $row;
+  }
+  return $results;  
+}
+
+
+
+function taxomomy_nco_clustering_clusters_calculate_all($term_data, $nco_local = 0.06, $power = 5) {
+  $forced_seeds =  taxonmy_nco_clustering_get_forced_seeds();
+  $term_data = array_merge($forced_seeds, $term_data);
+  return taxomomy_nco_clustering_clusters_calculate($term_data, $nco_local, $power);
+}
+
+// load all terms, sorted by count
+// loop through terms
+// if current term does not appear in a cluster, then it is a new cluster
+// for each cluster, select all terms within x distance and add them to the cluster
+
+function taxomomy_nco_clustering_clusters_calculate($term_data, $nco_local = 0.06, $power = 5) {
+  $clusters = array();
+  $lookup = array();
+  
+  $forced_seeds =  taxonmy_nco_clustering_get_forced_seeds();  
+  foreach ($term_data as $term) {    
+    if (!$lookup[$term['tid']] or $forced_seeds[$term['tid']]) {      
+      _taxonomy_nco_cluster_walk(&$clusters, &$lookup, $term['tid'], $term['tid'], $nco_local, $power);
+    }     
+  }
+  return $clusters;
+}
+
+/**
+ * Recursively walks terms to build clusters
+ * @param $clusters
+ * @param $lookup
+ * @param $clusterid
+ * @param $tid
+ * @param $nco_local
+ * @param $power
+ * @return unknown_type
+ */
+function _taxonomy_nco_cluster_walk(&$clusters, &$lookup, $clusterid, $tid, $nco_local, $power) {
+  $clusters[$clusterid][$tid] = $tid; // add current tid to cluster
+  $lookup[$tid] = 1; // this tid is in a cluster
+  $local_members = taxonomy_nco_related_terms(array($tid), $nco_local); // look for local terms
+  if ($local_members) {
+    // we have nearby terms, walk them
+    foreach ($local_members as $member => $nco) {      
+      if ( $power - (1 - $nco) > 0  // we are within the max scope       
+          and !$clusters[$clusterid][$member]) { // and are not yet within the cluster
+        _taxonomy_nco_cluster_walk($clusters, $lookup, $clusterid, $member, $nco_local, ($power - (1 - $nco)));
+      }
+    }
+  }
+}
+
+/**
+ * Replaces the entire cluster database with new data
+ * @param $clusters
+ * @return unknown_type
+ */
+function taxonomy_nco_clustering_clusters_insert($clusters) {
+  db_query("DELETE FROM {taxonomy_nco_cluster}");
+  $sql = "INSERT INTO {taxonomy_nco_cluster} (clusterid, tid) VALUES (%d, %d)";
+  foreach ($clusters as $cluster => $members) {
+    foreach ($members as $tid)
+      db_query($sql, $cluster, $tid);
+  }
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Theme functions                                                                                //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/*
+ * Theme a simple display of the top cluster terms.
+ * 
+ * Specify the number of top clusters required in $limit
+ * Term counts are optional as link title hovers ($diaplay_counts)
+ * 
+ * @param cardinal $limit
+ * @param boolean $display_counts 
+ */
+function theme_taxonomy_nco_clustering_top_clusters($limit = NULL, $display_counts = FALSE) {
+  $clusters = taxonomy_nco_clustering_top_clusters($limit);
+  $output = '';
+  foreach ($clusters as $cluster) {
+    $title_array = NULL;
+    if ($display_counts) {
+      $count = $cluster['count'];
+      $term = taxonomy_get_term($cluster['tid']);
+      $title = format_plural($count,
+                             t('One node tagged with terms in the !term cluster', array('!term' => $term->name)),
+                             t('@count nodes tagged with terms in the !term cluster', array('!term' => $term->name)));
+      $title_array = array('title' => $title);
+    }
+    $output .= l($cluster['name'], taxonomy_term_path($term), $title_array);
+    $output .= ' ';
+  }
+  return $output;
+}

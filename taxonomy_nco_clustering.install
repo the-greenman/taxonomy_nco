@@ -1,0 +1,14 @@
+<?php
+
+
+function taxonomy_nco_clustering_install(){
+  $sql = "CREATE TABLE {taxonomy_nco_cluster} (
+    `clusterid` INT NOT NULL ,
+    `tid` INT NOT NULL ,
+    PRIMARY KEY ( `clusterid` , `tid` ) ,
+    INDEX ( `tid` )
+    ) ";
+  db_query($sql);
+  
+  
+}

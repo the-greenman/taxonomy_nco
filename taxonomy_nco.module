@@ -1,0 +1,401 @@
+<?php
+// $Id$
+
+/**
+ * @mainpage Taxonomy NCO
+ * 
+ * @file 
+ * Taxonomy nco - this module uses the data in the taxonomy_nco table to find similarities between taxonomy terms
+ *
+ * function taxonomy_nco_similar_terms allows other modules to query the NCO table 
+ * to find related terms for a given nco and intersection cutoff value.
+ * 
+ * function theme_taxonomy_nco_related_terms gives a themed set of taxonomy links
+ * 
+ * function theme_taxonomy_nco_skos_rdf gives RDF SKOS serialisation XML to express similarities found by NCO
+ * 
+ * function theme_taxonomy_nco_skos_rdfa gives RDFa inline SKOS serialisation to express similarities found by NCO
+ * 
+ * Views argument handler taxonomy_nco gives a taxonomy view filter for a given term and similar terms
+ * 
+ */
+
+
+DEFINE('MINIMUM_MATCH_INTERSECTION', 3); // we must have intersection >= to this to find matches
+DEFINE('DEFAULT_MINIMUM_MATCH_NCO', 0.032); // We must have NCO >= to this to find a match - this is the default if you don't pass a value
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Functions for using the NCO data                                                                //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Find similar terms to to a given term
+ * Use taxonomy_nco table and given cutoff values to determine similarity
+ *
+ * @param unknown_type $tids
+ * @param $minimum_match_nco
+ * @return array of tid + nco
+ */
+function taxonomy_nco_related_terms($tids, $minimum_match_nco = -1) {
+  // TODO: check this string is a float
+  //watchdog('taxonomy nco', 'Similar terms request NCO: '. $minimum_match_nco);
+  if ($minimum_match_nco == '' or $minimum_match_nco == -1) {
+    $minimum_match_nco = variable_get('taxonomy_nco_default_minimum_match_nco', DEFAULT_MINIMUM_MATCH_NCO);
+  }
+  // cached related tids query
+  static $similars = array();
+  if (($similars['input_tids'] != $tids) or ($similars['minimum_nco'] != $minimum_match_nco)) {
+    $tid_list = implode(',', (array) $tids); // only does numbers so safe
+    $sql = "SELECT tid_b, nco FROM {taxonomy_nco}
+            WHERE tid_a IN (%s)
+            AND (a_and_b >= %d)
+            AND (nco >= %f)
+            ORDER BY nco DESC";
+    $minimum_match_intersection = variable_get('taxonomy_nco_minimum_match_intersection', MINIMUM_MATCH_INTERSECTION);
+    $result = db_query($sql, $tid_list, $minimum_match_intersection, $minimum_match_nco);
+    while ($row = db_fetch_array($result)) {
+      $output[$row['tid_b']] = $row['nco'];
+    }    
+    // now get manual overrides
+    $sql = "SELECT tid_b, nco FROM {taxonomy_nco_forced}
+            WHERE tid_a IN (%s)";                                        
+    $result = db_query($sql, $tid_list);
+    while ($row = db_fetch_array($result)) {
+      $output[$row['tid_b']] = $row['nco'];
+    }
+    asort($output);    
+    $similars['input_tids'] = $tids;
+    $similars['minimum_nco'] = $minimum_match_nco;
+    $similars['output_tids'] = $output;
+  } 
+  else {
+    $output = $similars['output_tids'];
+  }
+  return $output;
+}
+
+/**
+ * Find similar terms to to a given term
+ * Use taxonomy_nco table and given cutoff values to determine similarity
+ *
+ * @param unknown_type $tids
+ * @param $minimum_match_nco
+ * @return array of tids
+ */
+function taxonomy_nco_similar_terms($tids, $minimum_match_nco = -1) {
+  $data = taxonomy_nco_related_terms($tids);  
+  if ($data) {
+   $output = array_keys($data); 
+  } 
+  return $output;
+}
+
+function taxonomy_nco_get_relationship($tid_a, $tid_b) {
+  return db_fetch_array(db_query('select * from {taxonomy_nco} where tid_a = %d and tid_b = %d', $tid_a, $tid_b));
+}
+
+/**
+ * Add a forced relationship to the nco database
+ * @param $tid_a
+ * @param $tid_b
+ * @param $nco
+ * @return unknown_type
+ */
+function taxonomy_nco_force_similar_terms($tid_a, $tid_b, $nco) {
+  if ($nco >0) {
+    $sql = "replace into {taxonomy_nco_forced} (tid_a, tid_b, nco) values (%d, %d, %f)";
+    $result = db_query($sql, $tid_a, $tid_b, $nco);
+    $sql = "replace into {taxonomy_nco_forced} (tid_a, tid_b, nco) values (%d, %d, %f)";
+    $result = db_query($sql, $tid_b, $tid_a, $nco);
+  } 
+  else {
+    db_query('delete from {taxonomy_nco_forced} where tid_a = %d and tid_b = %d');
+  }
+}
+
+
+/**
+ * Theme related terms .. for .. 'Also showing..'
+ * This function makes use of 2 functions brought in from our contrib module taxonomy_api
+ * The functions have been bought in to this module to avoid dependency (below)
+ *
+ * @param array $tids
+ * @param float $minimum_nco
+ * @param boolean $display_counts
+ * 
+ * @return string
+ */
+function theme_taxonomy_nco_related_terms($tids, $minimum_nco, $display_counts = FALSE) {
+  $related_terms = taxonomy_nco_similar_terms($tids, $minimum_nco);
+  $output = '';
+  if (count($related_terms)) {
+    foreach ($related_terms as $tid) {
+      $output .= ' ';
+      $output .= theme('taxonomy_nco_term_link', $tid, $display_counts);
+    }      
+  }
+  return $output;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// RDF - for use in XML feeds                                                                      //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Theme an RDF SKOS serialisation for a taxonomy term and related terms based on a given NCO 
+ * cutoff level. This format is not suitable for use inline in Drupal pages.
+ * 
+ * For inline use please see the RDFa below.
+ *
+ * @param unknown_type $tid
+ * @param unknown_type $minimum_nco
+ * @param unknown_type $concept_url
+ * @param unknown_type $in_scheme_url
+ */
+function theme_taxonomy_nco_skos_rdf($tid, $minimum_nco, $concept_url, $in_scheme_url) {
+  $related_tids = taxonomy_nco_similar_terms($tid, $minimum_nco);
+  $term = taxonomy_get_term($tid);
+  $pref_label = $term->name;
+  $output = '';
+  $output .= '<rdf:RDF 
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" 
+    xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"
+    xmlns:skos="http://www.w3.org/2004/02/skos/core#">';
+  $output .= '<skos:Concept rdf:about="'. $concept_url .'">';
+  $output .= '<skos:prefLabel>'. $pref_label .'</skos:prefLabel>';
+  foreach ($related_tids as $related_tid) {
+    $related_term = taxonomy_get_term($related_tid);
+    $related_term_url = url(taxonomy_term_path($related_term), NULL, NULL, TRUE);
+    $output .= '<skos:related rdf:resource="'. $related_term_url .'"/>';
+  }
+  $output .= '<skos:inScheme rdf:resource="'. $in_scheme_url .'"/>';   // todo: add nested preflabel inside inscheme
+  $output .= '</skos:Concept>';
+  $output .= '</rdf:RDF>';
+  return $output;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// RDFa - for use inline in html pages                                                             //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * All pages containing RDFa need to have this doctype at the very top rather than the basic XHTML 
+ * or HTML doctype declatation. We recon it's OK to just paste this declaration into page.tpl.php for
+ * the whole site, replacing the XHTML one there.
+ *
+ * @return string
+ */
+function theme_taxonomy_nco_rdf_doctype() {
+  $output = '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML+RDFa 1.0//EN" "http://www.w3.org/MarkUp/DTD/xhtml-rdfa-1.dtd">';
+  return $output;
+}
+
+/**
+ * Theme an RDFa graph to describe inferred semantic relations in skos format
+ *
+ * The scheme URL is often at the base of the pages that form the taxonomy tree,
+ * it should provide an introduction to the vocabulary / resource.
+ * 
+ * The scheme label should describe the vocabulary in a very few words eg. "School of Everything Subjects"
+ * 
+ * @param integer $tid
+ * @param float $minimum_nco
+ * @param string $concept_url
+ * @param string $scheme_url
+ * @param string $scheme_label
+ */
+function theme_taxonomy_nco_skos_rdfa($tid, $minimum_nco, $scheme_url, $scheme_label) {
+  $related_tids = taxonomy_nco_similar_terms($tid, $minimum_nco);
+  $term = taxonomy_get_term($tid);
+  $concept_url = url(taxonomy_term_path($term), NULL, NULL, TRUE);
+  $pref_label = $term->name;
+  $output = '';
+  $output .= '<div xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"';
+  $output .=     ' xmlns:rdfs="http://www.w3.org/2000/01/rdf-schema#"';
+  $output .=     ' xmlns:skos="http://www.w3.org/2004/02/skos/core#">';
+  $output .= '<div about="'. $concept_url .'" typeof="skos:Concept">';
+  $output .= '<span property="skos:prefLabel" content="'. $pref_label .'" />';
+  // The inscheme URL is often at the base of the pages that form the taxonomy tree
+  // It should provide an introduction to the vocabulary / resource
+  $output .= '<span rel="skos:inScheme" resource="'. $scheme_url .'">';
+  $output .= '<span property="skos:prefLabel" content="'. $scheme_label .'" />';
+  // I wonder if we can add a description as well to say that eg. that this is a freetagging vocabulary with 
+  // related terms inferred taxonomy_nco via. normalised co-occurrence analysis
+  $output .= '</span>';
+  // Describe related terms found by NCO
+  foreach ($related_tids as $related_tid) {
+    $related_term = taxonomy_get_term($related_tid);
+    $related_term_url = url(taxonomy_term_path($related_term), NULL, NULL, TRUE);
+    $related_term_name = $related_term->name;
+    $output .= '<span rel="skos:related" resource="'. $related_term_url .'">';
+    $output .= '<span property="skos:prefLabel" content="'. $related_term_name .'" />';
+    $output .= '</span>';
+  }
+  $output .= '</div></div>';
+  return $output;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Taxonomy API                                                                                    //
+// These functions are brought in from taxonomy_api to avoid dependency and optimised for NCO      //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Count how many times a term has been used.
+ *
+ * @param $tid
+ *   integer: a term ID
+ * @return
+ *   integer: the number of times that the term has been used
+ */
+function taxonomy_nco_get_tid_node_count($tid, $type = '- ALL -') {
+  static $counts = array();
+  if (!$count = $counts[$tid][$type]) {
+    if ($type == '- ALL -') {
+      $sql = "SELECT count( tid ) AS count FROM {term_node} WHERE tid = %d";
+    }
+    else {
+      $sql = "SELECT count( tn.tid ) AS count FROM {term_node} tn, {node} node WHERE node.nid = tn.nid AND tn.tid = %d AND node.type = '%s'";
+    }
+    $count = db_result(db_query($sql, $tid, $type));
+    $counts[$tid][$type] = $count;
+  }
+  return $count;
+}
+
+/**
+ * Theme a link to a taxonomy term.
+ *
+ * @param  $tid
+ *   integer: a term ID
+ * @param $display_counts
+ *   boolean: whether to display hover counts on the term links
+ * @return
+ *   A string containing themed output.
+ */
+function theme_taxonomy_nco_term_link($tid, $display_counts = FALSE) {
+  if (is_numeric($tid)) {
+    $term = taxonomy_get_term($tid);
+    $title_array = NULL;
+    if ($display_counts) {
+      $count = taxonomy_nco_get_tid_node_count($tid);
+      $title = format_plural(
+               $count,
+               t('One node tagged as !term', array('!term' => $term->name)),
+               t('@count nodes tagged as !term', array('!term' => $term->name))
+      );
+      $title_array = array('title' => $title);
+    }
+    $output = l($term->name, taxonomy_term_path($term), $title_array);
+  }
+  return $output;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+// Views integration                                                                               //
+// This Views 1 argument handler allows taxonomy views to be extended with NCO similar terms       //
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * implementation of hook_views_arguments();
+ *
+ * @return unknown
+ */
+function taxonomy_nco_views_arguments() {
+  $arguments = array(
+    'taxonomy_nco' => array(
+      'name' => t('Taxonomy NCO similar terms'),
+      'handler' => 'views_handler_arg_taxonomy_nco',
+      'option' => 'string',
+      'help' => t('The argument will filter by a taxonomy term ID and add similar terms using NCO. Set the option to the NCO cutoff required.'),
+    ),
+  ); 
+  return $arguments;
+}
+
+/**
+ * This views argument handler takes as its argument a taxonomy term ID ($tid)
+ * The options field should be used to pass an NCO cutoff value, which the argument handler uses to exetend the view filter
+ * to inculde similar taxonomy terms according the the NCO table. 
+ *
+ * @param unknown_type $op
+ * @param unknown_type $query
+ * @param unknown_type $argtype
+ * @param unknown_type $arg
+ * @return unknown
+ */
+function views_handler_arg_taxonomy_nco($op, &$query, $argtype, $arg = '') { 
+  switch($op) {
+    case 'summary':
+      $query->ensure_table('term_data', true);
+      $query->add_field('name', 'term_data');
+      $query->add_field('weight', 'term_data');
+      $query->add_field('tid', 'term_data');
+      $fieldinfo['field'] = "term_data.name";
+      return $fieldinfo;
+    case 'sort':
+      $query->add_orderby('term_data', 'weight', $argtype);
+      $query->add_orderby('term_data', 'name', $argtype);
+      break;
+    case 'filter':
+      if (!$arg) { // untagged only!
+        $query->ensure_table("term_node");
+        $query->add_where("term_node.tid IS NULL");
+      }
+      else {
+        list($op, $tids) = _views_break_phrase($arg);
+        // Find similar terms using taxonomy_nco module
+        $op = 'or';
+        if ($similar_tids = taxonomy_nco_similar_terms($tids, $argtype['options'])) {
+          $tids = array_merge($tids, $similar_tids);
+        }
+        if (count($tids)) { 
+          _views_add_taxonomy(strtoupper($op), $tids, 0, $query);
+          
+          // add custom order by manually adding to query object
+          //  .. to order view output with perfect matches first,
+          //  .. then by NCO
+          $tid_list = implode(',', $tids);
+          $query->add_field('tid', 'term_node', 'nco_tid');
+          $order_by ='field(nco_tid, '. $tid_list .')';
+          $query->orderby[] = $order_by;
+        } 
+        else {
+          // if we dont have any terms, force the query to fail
+          $query->add_where('0');
+        }
+      }
+      break;
+    case 'link':
+      $name = ($query->name ? $query->name : t('Uncategorized'));
+      return l($name, "$arg/" . intval($query->tid));
+    case 'title':
+      if (!$query) {
+        return t('Uncategorized');
+      }
+      if ($tid = termnode_get_tid_for_alias($query)) {
+        $info = array($tid); 
+      }
+      else {
+        list($type, $info) = _views_break_phrase($query);
+        if (!$info) {
+        return $query;
+        }  
+      } 
+      $tids = implode(',', $info); // only does numbers so safe
+      $result = db_query("SELECT name FROM {term_data} WHERE tid IN (%s)", $tids);
+      $title = '';
+      while ($term = db_fetch_object($result)) {
+        $title .= ($title ? ($type == 'or' ? ' + ' : ', ') : '') . check_plain($term->name);
+      }
+      if (!$title) $title = t('Uncategorized'); 
+      return $title;
+  }
+}
+
