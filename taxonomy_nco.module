@@ -65,7 +65,9 @@ function taxonomy_nco_related_terms($tids, $minimum_match_nco = -1) {
     while ($row = db_fetch_array($result)) {
       $output[$row['tid_b']] = $row['nco'];
     }
-    asort($output);    
+    if (is_array($output)) {
+       arsort($output); // sort by nco (1 - 0)     
+    }
     $similars['input_tids'] = $tids;
     $similars['minimum_nco'] = $minimum_match_nco;
     $similars['output_tids'] = $output;

@@ -199,14 +199,19 @@ function _taxonomy_nco_cluster_walk(&$clusters, &$lookup, $clusterid, $tid, $nco
 }
 
 /**
- * Replaces the entire cluster database with new data
+ * Save cluster data
  * @param $clusters
+ * @param $reset 
+ *   Delete all existing cluster data
  * @return unknown_type
  */
-function taxonomy_nco_clustering_clusters_insert($clusters) {
-  db_query("DELETE FROM {taxonomy_nco_cluster}");
+function taxonomy_nco_clustering_clusters_insert($clusters, $reset = true) {
+  if ($reset) {
+    db_query("DELETE FROM {taxonomy_nco_cluster}");
+  }
   $sql = "INSERT INTO {taxonomy_nco_cluster} (clusterid, tid) VALUES (%d, %d)";
   foreach ($clusters as $cluster => $members) {
+    db_query("DELETE FROM {taxonomy_nco_cluster} WHERE clusterid = %d", $cluster); // remove any existing data for this cluster
     foreach ($members as $tid)
       db_query($sql, $cluster, $tid);
   }
